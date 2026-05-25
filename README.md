@@ -697,6 +697,9 @@ Then open in [Windsurf](https://codeium.com/windsurf) and type: **"I want to con
 <td align="center"><a href="https://github.com/neilruaro-camb"><img src="https://github.com/neilruaro-camb.png" width="60" alt="neilruaro-camb"><br><sub><b>neilruaro-camb</b></sub></a><br>CAMB AI TTS Provider</td>
 <td align="center"><a href="https://github.com/aoi-dev-0411"><img src="https://github.com/aoi-dev-0411.png" width="60" alt="aoi-dev-0411"><br><sub><b>aoi-dev-0411</b></sub></a><br>Transcript Search, Health Badges</td>
 </tr>
+<tr>
+<td align="center"><a href="https://github.com/exaland"><img src="https://github.com/exaland.png" width="60" alt="exaland"><br><sub><b>exaland</b></sub></a><br>Outbound .ULAW Compatibility</td>
+</tr>
 </table>
 
 See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the full list and [Recognition Program](https://github.com/hkjarral/Asterisk-AI-Voice-Agent/blob/develop/docs/contributing/RECOGNITION.md) for how we recognize contributions.

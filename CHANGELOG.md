@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Outbound recording library `.ULAW` compatibility (#397)**: Recording-library lookup, preview, and listing now resolve uppercase `.ULAW` suffixes while keeping the media basename case-sensitive so distinct Linux filenames such as `Promo.ulaw` and `promo.ulaw` do not collide. Contributed by [@exaland](https://github.com/exaland).
+
 ## [6.5.2] - 2026-05-24
 
 ### Breaking Changes
