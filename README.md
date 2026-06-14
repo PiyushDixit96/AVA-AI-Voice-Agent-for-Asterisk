@@ -6,7 +6,7 @@
   <img alt="Asterisk AI Voice Agent" src="assets/banner_light_mode.png?v=9" width="100%">
 </picture>
 
-![Version](https://img.shields.io/badge/version-6.5.4-blue.svg)
+![Version](https://img.shields.io/badge/version-7.0.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![Docker](https://img.shields.io/badge/docker-compose-blue.svg)
@@ -168,6 +168,21 @@ docker compose -p asterisk-ai-voice-agent logs -f ai_engine
 ## 🎉 What's New
 
 <details open>
+<summary><b>v7.0.0 — the Agents release 🎯</b></summary>
+
+The biggest release yet: **manage your AI agents from the Admin UI, not a config file.**
+
+- **🤖 Agents tab** — create, edit, and manage agents in the UI. Start from a template (receptionist, after-hours, appointment booker, and more), set the prompt, voice, and provider, and copy a ready-to-paste dialplan snippet.
+- **📊 Multi-agent dashboard** — live KPIs (active agents, active calls, calls routed, transfers), per-agent stats, and routing breakdowns at a glance.
+- **☎️ New `AI_AGENT` dialplan variable** — route a call to an agent by name. Your existing `AI_CONTEXT` dialplans keep working unchanged.
+- **🔄 Automatic migration** — your existing contexts move into a local agents database on first start. Nothing to do, and rollback is one command.
+- **🔒 Security hardening** — no more `admin`/`admin`: a one-time admin password is generated and must be changed at first login. Config exports no longer bundle your `.env` by default.
+
+⚠️ Major release — please read the [Upgrade Notes](CHANGELOG.md) before upgrading from 6.x.
+
+</details>
+
+<details>
 <summary><b>v6.5.4 (2026-05-25) — OpenAI Realtime GA cleanup across every code path</b></summary>
 
 Follow-up to the v6.5.3 hotfix. v6.5.3 only flipped `config/ai-agent.yaml`; v6.5.4 brings the rest of the codebase in line:
