@@ -94,6 +94,14 @@ class CallRecordSummaryResponse(BaseModel):
     pipeline_name: Optional[str] = None
     context_name: Optional[str] = None
     routing_method: Optional[str] = None  # 'ai_agent' | 'ai_context' | 'default' | None
+    # Additive v7 aliases (do not replace context_name/routing_method):
+    # agent_slug mirrors the resolved agent (context_name) whenever the call was
+    # routed to one -- ai_agent, ai_context or default routing -- and is null for
+    # unknown/None routing. routing_method still tells you *how* it was selected.
+    # agent_name is a best-effort display-name lookup, null if agents.db is
+    # unavailable or the slug has no matching agent.
+    agent_slug: Optional[str] = None
+    agent_name: Optional[str] = None
     outcome: str = "completed"
     error_message: Optional[str] = None
     avg_turn_latency_ms: float = 0.0
@@ -116,6 +124,9 @@ class CallRecordResponse(BaseModel):
     pipeline_components: dict = {}
     context_name: Optional[str] = None
     routing_method: Optional[str] = None  # 'ai_agent' | 'ai_context' | 'default' | None
+    # Additive v7 aliases (see CallRecordSummaryResponse for semantics).
+    agent_slug: Optional[str] = None
+    agent_name: Optional[str] = None
     conversation_history: list = []
     outcome: str = "completed"
     transfer_destination: Optional[str] = None
@@ -229,8 +240,47 @@ def _normalize_phase_tool_calls(entries: list, phase: str) -> list:
     return normalized
 
 
-def _record_to_response(record) -> CallRecordResponse:
+def _agent_name_map() -> Dict[str, str]:
+    """Best-effort {slug: display_name} from the operator agents.db.
+
+    Never raises: a missing, locked, or unreadable agents.db (e.g. headless/YAML-only
+    installs) just yields an empty map, so call-history responses still serve with
+    agent_name=None. Build this once per request and pass it into the converters to
+    avoid N+1 lookups."""
+    try:
+        from agents_store import AgentsStore
+        with AgentsStore() as store:  # close the sqlite connection promptly
+            return {
+                a["slug"]: a.get("display_name")
+                for a in store.list_all()
+                if a.get("slug")
+            }
+    except Exception:
+        return {}
+
+
+def _resolve_agent(record, agent_names: Optional[Dict[str, str]]):
+    """Compute the additive (agent_slug, agent_name) aliases for a record.
+
+    These reflect the resolved agent whenever the call was routed to one, so
+    integrations can consume the selected agent uniformly: agent_slug mirrors
+    context_name (the resolved agent slug) for ai_agent, ai_context and default
+    routing. routing_method remains the field that explains *how* the agent was
+    selected. For unknown/None routing they stay None.
+
+    agent_name is a best-effort display-name lookup keyed on the slug and is None
+    when the agents DB is unavailable or has no matching slug."""
+    routing_method = getattr(record, "routing_method", None)
+    context_name = record.context_name
+    if routing_method not in ("ai_agent", "ai_context", "default") or not context_name:
+        return None, None
+    agent_name = (agent_names or {}).get(context_name)
+    return context_name, agent_name
+
+
+def _record_to_response(record, agent_names: Optional[Dict[str, str]] = None) -> CallRecordResponse:
     """Convert a CallRecord to a response model."""
+    agent_slug, agent_name = _resolve_agent(record, agent_names)
     return CallRecordResponse(
         id=record.id,
         call_id=record.call_id,
@@ -244,6 +294,8 @@ def _record_to_response(record) -> CallRecordResponse:
         pipeline_components=record.pipeline_components or {},
         context_name=record.context_name,
         routing_method=getattr(record, "routing_method", None),
+        agent_slug=agent_slug,
+        agent_name=agent_name,
         conversation_history=record.conversation_history or [],
         outcome=record.outcome,
         transfer_destination=record.transfer_destination,
@@ -265,8 +317,9 @@ def _record_to_response(record) -> CallRecordResponse:
     )
 
 
-def _record_to_summary_response(record) -> CallRecordSummaryResponse:
+def _record_to_summary_response(record, agent_names: Optional[Dict[str, str]] = None) -> CallRecordSummaryResponse:
     """Convert a CallRecord to a summary response model."""
+    agent_slug, agent_name = _resolve_agent(record, agent_names)
     return CallRecordSummaryResponse(
         id=record.id,
         call_id=record.call_id,
@@ -279,6 +332,8 @@ def _record_to_summary_response(record) -> CallRecordSummaryResponse:
         pipeline_name=record.pipeline_name,
         context_name=record.context_name,
         routing_method=getattr(record, "routing_method", None),
+        agent_slug=agent_slug,
+        agent_name=agent_name,
         outcome=record.outcome,
         error_message=record.error_message,
         avg_turn_latency_ms=record.avg_turn_latency_ms,
@@ -415,9 +470,10 @@ async def list_calls(
     )
     
     total_pages = (total + page_size - 1) // page_size if total > 0 else 1
-    
+
+    agent_names = _agent_name_map()  # one best-effort lookup for the whole page
     return CallListResponse(
-        calls=[_record_to_summary_response(r) for r in records],
+        calls=[_record_to_summary_response(r, agent_names) for r in records],
         total=total,
         page=page,
         page_size=page_size,
@@ -501,7 +557,7 @@ async def get_call(record_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Call record not found")
     
-    return _record_to_response(record)
+    return _record_to_response(record, _agent_name_map())
 
 
 @router.get("/calls/{record_id}/transcript")
@@ -920,10 +976,11 @@ async def export_calls_json(
     )
     
     # Convert to JSON-serializable format
+    agent_names = _agent_name_map()
     data = {
         "exported_at": datetime.now().isoformat(),
         "total_records": len(records),
-        "records": [_record_to_response(r).model_dump() for r in records]
+        "records": [_record_to_response(r, agent_names).model_dump() for r in records]
     }
     
     json_content = json.dumps(data, indent=2)
