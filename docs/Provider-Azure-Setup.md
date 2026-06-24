@@ -96,6 +96,12 @@ pipelines:
 active_pipeline: azure_hybrid
 ```
 
+Streaming modular STT audio is normalized by the engine to headerless PCM16-LE,
+mono, at 16 kHz. The Admin UI manages this format automatically. Legacy
+`stream_format` or `sample_rate` values that conflict with the engine bus are
+ignored at runtime with a warning so Azure always receives metadata matching
+the submitted audio bytes.
+
 ### 5. Configure Asterisk Dialplan
 
 Add to `/etc/asterisk/extensions_custom.conf`:
@@ -116,7 +122,7 @@ Azure STT supports two variants controlled by the `variant` field:
 
 | Variant | Method | Best For |
 |---------|--------|----------|
-| `realtime` (default) | REST POST with binary WAV | General telephony STT, low-latency single utterances |
+| `realtime` (default) | Continuous Speech SDK push stream | Live, low-latency conversations |
 | `fast` | Fast Transcription API (multipart POST) | Batch-style transcription, longer audio segments |
 
 Switch variants in YAML:

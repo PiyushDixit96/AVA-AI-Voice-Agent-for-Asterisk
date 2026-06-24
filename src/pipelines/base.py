@@ -27,6 +27,14 @@ except ImportError:
     websockets = None
 
 
+STREAMING_STT_FORMAT_ALIASES: frozenset[str] = frozenset({
+    "pcm16",
+    "pcm16_16k",
+    "pcm16-16k",
+    "linear16",
+})
+
+
 @dataclass
 class LLMResponse:
     """Standard response from an LLM, containing text and/or tool calls."""
@@ -269,6 +277,11 @@ class Component(ABC):
 
 class STTComponent(Component):
     """Speech-to-text component."""
+
+    # Streaming adapters opt in explicitly. The engine must not infer support
+    # from incidental method names because buffered-only adapters share this
+    # base class.
+    supports_streaming: bool = False
 
     @abstractmethod
     async def transcribe(

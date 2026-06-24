@@ -27,7 +27,13 @@ from ..config import AppConfig, LocalProviderConfig
 _MAX_RECONNECT_ATTEMPTS = 3
 _RECONNECT_DELAY_BASE_SEC = 0.5
 from ..logging_config import get_logger
-from .base import LLMComponent, LLMResponse, STTComponent, TTSComponent
+from .base import (
+    LLMComponent,
+    LLMResponse,
+    STREAMING_STT_FORMAT_ALIASES,
+    STTComponent,
+    TTSComponent,
+)
 
 logger = get_logger(__name__)
 
@@ -520,6 +526,8 @@ class _LocalAdapterBase:
 class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
     """# Milestone7: STT adapter backed by the local AI server."""
 
+    supports_streaming = True
+
     def __init__(
         self,
         component_key: str,
@@ -540,7 +548,18 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         self,
         call_id: str,
         options: Optional[Dict[str, Any]] = None,
+        *,
+        sample_rate_hz: int,
+        fmt: str,
     ) -> None:
+        normalized_fmt = str(fmt or "").strip().lower()
+        if normalized_fmt not in STREAMING_STT_FORMAT_ALIASES:
+            raise ValueError(f"Unsupported Local streaming STT format: {fmt!r}")
+        if int(sample_rate_hz) != 16000:
+            raise ValueError(
+                "Local streaming STT requires the canonical 16000 Hz pipeline bus "
+                f"(received {sample_rate_hz})"
+            )
         runtime_options = options or {}
         session = await self._ensure_session(call_id, runtime_options)
         if session.send_lock is None:
@@ -557,6 +576,8 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             "Local STT streaming started",
             component=self.component_key,
             call_id=call_id,
+            stream_format=normalized_fmt,
+            sample_rate_hz=sample_rate_hz,
         )
 
     async def send_audio(
@@ -763,7 +784,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         if not audio:
             return audio
         fmt = fmt.lower()
-        if fmt in {"pcm16", "pcm16_16k", "pcm16-16k"}:
+        if fmt in STREAMING_STT_FORMAT_ALIASES:
             return audio
         if fmt in {"pcm16_8k", "pcm16-8k"}:
             state = self._resample_states.get(call_id)
