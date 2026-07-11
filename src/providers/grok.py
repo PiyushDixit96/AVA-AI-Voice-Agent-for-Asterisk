@@ -115,6 +115,16 @@ class GrokProvider(AIProviderInterface):
         self._session_voice: Optional[str] = None  # Per-call voice override from agent/context
         self._pending_response: bool = False
         self._current_response_id: Optional[str] = None  # Track active response for cancellation
+        # xAI can finish generating audio well before telephony playback drains.  Retain
+        # the latest assistant audio item after response.done so a later caller
+        # interruption can truncate conversation history at the point actually played.
+        self._assistant_audio_item_id: Optional[str] = None
+        self._assistant_audio_content_index: int = 0
+        self._assistant_audio_response_id: Optional[str] = None
+        # Local telephony VAD can detect a caller before xAI server VAD does.  Once
+        # that happens, quarantine remaining deltas from the interrupted response
+        # until xAI creates the replacement response.
+        self._drop_output_until_next_response: bool = False
         self._greeting_response_id: Optional[str] = None  # Track greeting to protect from barge-in
         self._greeting_completed: bool = False  # Track if greeting has finished
         # Debounce engine-level barge-in signals (prevents flush storms).
@@ -618,29 +628,34 @@ class GrokProvider(AIProviderInterface):
             logger.error("Failed to send audio to Grok", call_id=self._call_id, exc_info=True)
 
     async def speak_text(self, text: str) -> bool:
-        """Create a tools-disabled response in the active configured voice."""
+        """Speak an exact, interruptible platform message in the configured voice.
+
+        xAI's ``force_message`` item is designed for deterministic announcements
+        such as inactivity prompts.  It injects its own response lifecycle, so a
+        follow-up ``response.create`` must not be sent.  A bare response request
+        with per-response instructions can be ignored by server-VAD sessions when
+        no new conversation item has been committed.
+        """
         if not text or not self.websocket or self.websocket.state.name != "OPEN":
             return False
-        response: Dict[str, Any] = {
-            "instructions": (
-                "Speak exactly the sentence between <message> tags. Do not add, remove, "
-                f"or paraphrase words. Do not call tools. <message>{text}</message>"
-            ),
-            "tools": [],
-        }
-        if not self._is_ga:
-            response["modalities"] = self._response_modalities
-            response["input"] = []
         try:
             await self._send_json(
                 {
-                    "type": "response.create",
-                    "event_id": f"resp-no-input-{uuid.uuid4()}",
-                    "response": response,
+                    "type": "conversation.item.create",
+                    "event_id": f"force-no-input-{uuid.uuid4()}",
+                    "item": {
+                        "type": "force_message",
+                        "content": [{"type": "input_text", "text": text}],
+                        "interruptible": True,
+                    },
                 }
             )
             self._pending_response = True
-            logger.info("Sent no-input announcement to Grok", call_id=self._call_id, text_preview=text[:80])
+            logger.info(
+                "Sent no-input force_message to Grok",
+                call_id=self._call_id,
+                text_preview=text[:80],
+            )
             return True
         except Exception:
             logger.warning("Failed to send no-input announcement to Grok", call_id=self._call_id, exc_info=True)
@@ -1062,8 +1077,8 @@ class GrokProvider(AIProviderInterface):
         td_config: Dict[str, Any] = {
             "type": "server_vad",
             "threshold": 0.5,
-            "silence_duration_ms": 200,
-            "prefix_padding_ms": 200,
+            "silence_duration_ms": 600,
+            "prefix_padding_ms": 300,
         }
         if getattr(self.config, "turn_detection", None):
             try:
@@ -1379,32 +1394,19 @@ class GrokProvider(AIProviderInterface):
             await self.websocket.send(message)
     
     async def _cancel_response(self, response_id: str):
-        """
-        Cancel an in-progress response when user interrupts (barge-in).
-        
-        This implements the Grok Voice Agent API's response.cancel event,
-        which stops audio generation and discards remaining chunks when
-        the user starts speaking during an AI response.
-        
-        See: https://platform.openai.com/docs/api-reference/realtime-client-events/response/cancel
-        """
+        """Cancel an in-progress response in manual/non-VAD mode."""
         if not self.websocket or self.websocket.state.name != "OPEN":
             return
 
         try:
-            cancel_payload = {
-                "type": "response.cancel",
-                "event_id": f"cancel-{uuid.uuid4()}",
-                "response_id": response_id
-            }
-            await self._send_json(cancel_payload)
-            logger.debug(
-                "Sent response.cancel to Grok",
-                call_id=self._call_id,
-                response_id=response_id
+            await self._send_json(
+                {
+                    "type": "response.cancel",
+                    "event_id": f"cancel-{uuid.uuid4()}",
+                    "response_id": response_id,
+                }
             )
-            # Local egress can have buffered audio (pacer/outbuf). Flush it immediately so the interrupted
-            # sentence does not resume locally even if Grok continues sending a few in-flight frames.
+            logger.debug("Sent response.cancel to Grok", call_id=self._call_id, response_id=response_id)
             try:
                 await self._emit_audio_done()
             except Exception:
@@ -1425,8 +1427,73 @@ class GrokProvider(AIProviderInterface):
                 "Failed to cancel Grok response",
                 call_id=self._call_id,
                 response_id=response_id,
-                exc_info=True
+                exc_info=True,
             )
+
+    def _server_vad_enabled(self) -> bool:
+        """Return whether xAI owns turn detection for the active session."""
+        td = getattr(self.config, "turn_detection", None)
+        if td is None:
+            return True
+        return str(getattr(td, "type", "server_vad") or "").lower() == "server_vad"
+
+    async def truncate_assistant_audio(self, audio_end_ms: int) -> bool:
+        """Truncate the last assistant audio item to what reached the caller."""
+        item_id = self._assistant_audio_item_id
+        if not item_id or not self.websocket or self.websocket.state.name != "OPEN":
+            return False
+        try:
+            end_ms = max(0, int(audio_end_ms))
+            await self._send_json(
+                {
+                    "type": "conversation.item.truncate",
+                    "event_id": f"truncate-{uuid.uuid4()}",
+                    "item_id": item_id,
+                    "content_index": int(self._assistant_audio_content_index or 0),
+                    "audio_end_ms": end_ms,
+                }
+            )
+            logger.info(
+                "Sent conversation.item.truncate to Grok",
+                call_id=self._call_id,
+                item_id=item_id,
+                content_index=int(self._assistant_audio_content_index or 0),
+                audio_end_ms=end_ms,
+            )
+            return True
+        except Exception:
+            logger.warning(
+                "Failed to truncate Grok assistant audio item",
+                call_id=self._call_id,
+                item_id=item_id,
+                exc_info=True,
+            )
+            return False
+
+    async def handle_local_barge_in(self) -> int:
+        """Flush provider-side egress after AVA's local VAD interrupts playback."""
+        dropped = 0
+        self._drop_output_until_next_response = True
+        try:
+            async with self._pacer_lock:
+                dropped = len(self._outbuf)
+                self._outbuf.clear()
+        except Exception:
+            logger.debug("Failed clearing Grok provider buffer on local barge-in", call_id=self._call_id, exc_info=True)
+        self._pacer_running = False
+        try:
+            if self._pacer_task and not self._pacer_task.done():
+                self._pacer_task.cancel()
+        except Exception:
+            logger.debug("Failed stopping Grok provider pacer on local barge-in", call_id=self._call_id, exc_info=True)
+        self._in_audio_burst = False
+        logger.info(
+            "Flushed Grok provider egress on local barge-in",
+            call_id=self._call_id,
+            dropped_bytes=dropped,
+            response_id=self._current_response_id or self._assistant_audio_response_id,
+        )
+        return dropped
 
     async def _emit_provider_barge_in(self, *, event_type: str) -> None:
         """Notify the engine that provider-side VAD detected user interruption.
@@ -1706,6 +1773,13 @@ class GrokProvider(AIProviderInterface):
             response = event.get("response", {})
             response_id = response.get("id")
             if response_id:
+                if self._drop_output_until_next_response:
+                    logger.info(
+                        "Releasing Grok output quarantine for replacement response",
+                        call_id=self._call_id,
+                        response_id=response_id,
+                    )
+                    self._drop_output_until_next_response = False
                 self._current_response_id = response_id
                 # Reset per-response audio tracking.
                 try:
@@ -1735,6 +1809,41 @@ class GrokProvider(AIProviderInterface):
                     self._farewell_waiting_for_audio_done = True
                 else:
                     logger.debug("Grok response created", call_id=self._call_id, response_id=response_id)
+            return
+
+        if event_type == "response.output_item.added":
+            item = event.get("item") or {}
+            if item.get("type") == "message" and item.get("role") == "assistant" and item.get("id"):
+                self._assistant_audio_item_id = str(item["id"])
+                self._assistant_audio_response_id = event.get("response_id") or self._current_response_id
+                self._assistant_audio_content_index = 0
+                logger.debug(
+                    "Tracking Grok assistant response item",
+                    call_id=self._call_id,
+                    item_id=self._assistant_audio_item_id,
+                    response_id=self._assistant_audio_response_id,
+                )
+            return
+
+        if event_type == "response.content_part.added":
+            part = event.get("part") or {}
+            if part.get("type") in ("audio", "output_audio"):
+                item_id = event.get("item_id")
+                if item_id:
+                    self._assistant_audio_item_id = str(item_id)
+                try:
+                    self._assistant_audio_content_index = int(event.get("content_index", 0) or 0)
+                except (TypeError, ValueError):
+                    self._assistant_audio_content_index = 0
+            return
+
+        if event_type == "conversation.item.truncated":
+            logger.info(
+                "Grok assistant audio item truncated",
+                call_id=self._call_id,
+                item_id=event.get("item_id"),
+                audio_end_ms=event.get("audio_end_ms"),
+            )
             return
 
         if event_type == "response.delta":
@@ -2029,7 +2138,23 @@ class GrokProvider(AIProviderInterface):
                         call_id=self._call_id,
                         response_id=self._current_response_id
                     )
-                # SMOOTHNESS FIX: Don't cancel if response just started - prevents premature cutoff
+                # xAI documents automatic interruption in server_vad mode.  Do not
+                # send response.cancel there; it is the manual/non-VAD control and can
+                # race the provider's automatic turn transition.
+                elif self._server_vad_enabled():
+                    logger.info(
+                        "User interruption detected; xAI server VAD owns response cancellation",
+                        call_id=self._call_id,
+                        response_id=self._current_response_id,
+                    )
+                    await self._emit_provider_barge_in(event_type=event_type)
+                    try:
+                        async with self._pacer_lock:
+                            self._outbuf.clear()
+                        await self._emit_audio_done()
+                    except Exception:
+                        logger.debug("Failed clearing Grok local egress after VAD interruption", call_id=self._call_id, exc_info=True)
+                # Manual turn detection: retain explicit cancellation behavior.
                 elif self._response_audio_start_time:
                     elapsed = time.time() - self._response_audio_start_time
                     if elapsed < self._min_response_time_before_interrupt:
@@ -2084,16 +2209,20 @@ class GrokProvider(AIProviderInterface):
                                 self._outbuf.clear()
                         except Exception:
                             logger.debug("Failed to clear Grok egress buffer on barge-in", call_id=self._call_id, exc_info=True)
-                        try:
-                            await self._emit_audio_done()
-                        except Exception:
-                            logger.debug("Failed to stop Grok egress pacer on barge-in", call_id=self._call_id, exc_info=True)
                         logger.info(
                             "🎤 User speech started (no active response); requesting platform flush",
                             call_id=self._call_id,
                             event_type=event_type,
                         )
+                        # Notify the engine before provider audio-done cleanup.  The
+                        # cleanup path can await transport drain work; putting it first
+                        # makes buffered-tail interruptions feel sluggish even though
+                        # xAI detected caller speech promptly.
                         await self._emit_provider_barge_in(event_type=event_type)
+                        try:
+                            await self._emit_audio_done()
+                        except Exception:
+                            logger.debug("Failed to stop Grok egress pacer on barge-in", call_id=self._call_id, exc_info=True)
                 else:
                     logger.info("Grok input_audio_buffer ack", call_id=self._call_id, event_type=event_type)
             return
@@ -2195,6 +2324,13 @@ class GrokProvider(AIProviderInterface):
         logger.debug("Unhandled Grok Voice Agent event", event_type=event_type)
 
     async def _handle_output_audio(self, audio_b64: str):
+        if self._drop_output_until_next_response:
+            logger.debug(
+                "Dropping Grok audio from locally interrupted response",
+                call_id=self._call_id,
+                response_id=self._current_response_id or self._assistant_audio_response_id,
+            )
+            return
         try:
             raw_bytes = base64.b64decode(audio_b64)
         except Exception:
@@ -2860,18 +2996,21 @@ class GrokProvider(AIProviderInterface):
         self._pacer_running = True
         self._pacer_start_ts = time.monotonic()
         
-        # CRITICAL: Clear Grok's input audio buffer when we start outputting
-        # This prevents echo from being processed - any audio buffered before
-        # our local gating kicked in will be discarded by Grok
-        try:
-            clear_buffer_payload = {
-                "type": "input_audio_buffer.clear",
-                "event_id": f"clear-echo-{uuid.uuid4()}",
-            }
-            await self._send_json(clear_buffer_payload)
-            logger.debug("🔇 Cleared Grok input buffer for echo prevention", call_id=self._call_id)
-        except Exception:
-            logger.debug("Failed to clear input buffer", call_id=self._call_id, exc_info=True)
+        # With server_vad, xAI requires continuous input_audio_buffer.append.  Clearing
+        # here can erase a caller's overlapping utterance exactly when local VAD has
+        # stopped playback and the replacement turn is being captured.  Preserve the
+        # legacy clear only for explicit manual/non-VAD sessions.
+        if not self._server_vad_enabled():
+            try:
+                await self._send_json(
+                    {
+                        "type": "input_audio_buffer.clear",
+                        "event_id": f"clear-echo-{uuid.uuid4()}",
+                    }
+                )
+                logger.debug("🔇 Cleared Grok input buffer in manual turn mode", call_id=self._call_id)
+            except Exception:
+                logger.debug("Failed to clear input buffer", call_id=self._call_id, exc_info=True)
         
         try:
             if self._pacer_task and not self._pacer_task.done():

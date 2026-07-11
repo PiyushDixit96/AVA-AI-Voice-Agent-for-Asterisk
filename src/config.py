@@ -763,9 +763,9 @@ class GrokProviderConfig(BaseModel):
 
     class TurnDetectionConfig(BaseModel):
         type: str = Field(default="server_vad")
-        silence_duration_ms: int = Field(default=200)
+        silence_duration_ms: int = Field(default=600)
         threshold: float = Field(default=0.5)
-        prefix_padding_ms: int = Field(default=200)
+        prefix_padding_ms: int = Field(default=300)
 
     turn_detection: Optional[TurnDetectionConfig] = None
 
@@ -795,7 +795,7 @@ class BargeInConfig(BaseModel):
     greeting_protection_ms: int = Field(default=0)
     # Provider-owned mode: local VAD fallback only for providers that don't emit explicit interruption events.
     provider_fallback_enabled: bool = Field(default=True)
-    provider_fallback_providers: List[str] = Field(default_factory=lambda: ["google_live", "deepgram"])
+    provider_fallback_providers: List[str] = Field(default_factory=lambda: ["google_live", "deepgram", "grok"])
     # Provider-owned mode: suppress outbound provider audio locally after barge-in so continuing provider audio
     # doesn't immediately restart streaming playback.
     provider_output_suppress_ms: int = Field(default=1200)
@@ -1044,11 +1044,19 @@ class AppConfig(BaseModel):
     # prompt then hangs up so the caller is not left in silent dead air;
     # "leave_open" preserves the legacy behavior (log + cleanup only, line stays
     # open until the caller hangs up).
-    on_provider_failure: str = Field(default="announce_hangup")
+    on_provider_failure: Literal["announce_hangup", "dialplan_redirect", "leave_open"] = Field(
+        default="announce_hangup"
+    )
     # Asterisk sound file played to the caller before hangup when a provider fails
     # to start. May be a bare sound name ("custom/foo") or a "sound:"/"recording:"
     # URI. Best-effort: if missing/unplayable the channel is still hung up.
     provider_failure_prompt: str = Field(default="sorry-youre-having-problems")
+    # Opt-in recovery route used only when on_provider_failure=dialplan_redirect.
+    # The caller leaves Stasis and resumes at this dialplan location; auxiliary
+    # media channels are cleaned up without hanging up the caller channel.
+    provider_failure_redirect_context: Optional[str] = None
+    provider_failure_redirect_extension: str = Field(default="s", min_length=1)
+    provider_failure_redirect_priority: int = Field(default=1, ge=1)
 
     # Ensure tests that construct AppConfig(**dict) directly still get normalized pipelines
     # similar to load_config(), which calls _normalize_pipelines().

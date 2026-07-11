@@ -197,6 +197,33 @@ async def test_sustained_caller_speech_and_agent_output_pause_the_clock():
 
 
 @pytest.mark.asyncio
+async def test_unmatched_input_end_does_not_extend_check_in_grace_deadline():
+    watchdog = NoInputWatchdog(AsyncMock(return_value=True), AsyncMock(), clock=lambda: 1000.0)
+    policy = NoInputPolicy(initial_timeout_sec=30.0, grace_timeout_sec=15.0, max_check_ins=1)
+    await watchdog.register("call-unmatched-end", policy, is_outbound=False)
+    try:
+        state = watchdog._states["call-unmatched-end"]
+        state.ready = True
+        state.input_active = False
+        state.phase = "grace"
+        state.check_ins = 1
+        state.deadline = 1015.0
+
+        await watchdog.note_input_state(
+            "call-unmatched-end",
+            False,
+            "asterisk:talk_detect",
+        )
+
+        snapshot = watchdog.snapshot("call-unmatched-end")
+        assert snapshot["phase"] == "grace"
+        assert snapshot["check_ins"] == 1
+        assert snapshot["deadline"] == 1015.0
+    finally:
+        await watchdog.stop("call-unmatched-end")
+
+
+@pytest.mark.asyncio
 async def test_hosted_silence_output_pauses_without_resetting_deadline():
     announcements = []
 
@@ -271,6 +298,58 @@ async def test_raw_audio_detector_ignores_audio_during_native_provider_output():
     )
 
     engine.no_input_watchdog.note_input_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_talk_detect_echo_tail_does_not_pause_no_input_watchdog():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.config = SimpleNamespace(
+        barge_in=SimpleNamespace(enabled=True, post_tts_end_protection_ms=600)
+    )
+    engine._no_input_note_input_state = AsyncMock()
+    session = CallSession(
+        call_id="call-post-tts-echo",
+        caller_channel_id="channel-post-tts-echo",
+    )
+    session.audio_capture_enabled = True
+    session.tts_playing = False
+    session.tts_ended_ts = time.time()
+    await engine.session_store.upsert_call(session)
+
+    await engine._handle_channel_talking_started(
+        {"channel": {"id": session.caller_channel_id}}
+    )
+
+    engine._no_input_note_input_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_talk_detect_after_post_tts_guard_pauses_no_input_watchdog():
+    engine = Engine.__new__(Engine)
+    engine.session_store = SessionStore()
+    engine.config = SimpleNamespace(
+        barge_in=SimpleNamespace(enabled=True, post_tts_end_protection_ms=600)
+    )
+    engine._no_input_note_input_state = AsyncMock()
+    session = CallSession(
+        call_id="call-real-talking",
+        caller_channel_id="channel-real-talking",
+    )
+    session.audio_capture_enabled = True
+    session.tts_playing = False
+    session.tts_ended_ts = time.time() - 1.0
+    await engine.session_store.upsert_call(session)
+
+    await engine._handle_channel_talking_started(
+        {"channel": {"id": session.caller_channel_id}}
+    )
+
+    engine._no_input_note_input_state.assert_awaited_once_with(
+        session.call_id,
+        True,
+        "asterisk:talk_detect",
+    )
 
 
 @pytest.mark.asyncio

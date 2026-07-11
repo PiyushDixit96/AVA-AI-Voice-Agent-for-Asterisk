@@ -1,10 +1,13 @@
 """YAML contexts merge + normalized hash + one-time migration into agents.db.
-Merge semantics mirror src/config.py:_merge_external_contexts (inline wins;
-external files keyed by 'name'; system_prompt→prompt). Parity is covered by
-fixture tests, not cross-imports (admin_ui does not import src/ — decision D4)."""
+Merge semantics mirror the engine's effective configuration: base
+``ai-agent.yaml`` contexts, deep-merged operator overrides from
+``ai-agent.local.yaml``, then external context files for names not already
+present. Parity is covered by fixture tests, not cross-imports (admin_ui does
+not import src/ — decision D4)."""
 import glob
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import uuid
@@ -13,11 +16,31 @@ import yaml
 from agents_store import AgentsStore, slugify, _now
 
 
+logger = logging.getLogger(__name__)
+
+
+def _deep_merge_dicts(base: dict, override: dict) -> dict:
+    """Mirror src.config.loaders.deep_merge_dicts without importing engine code."""
+    merged = dict(base)
+    for key, override_val in override.items():
+        if override_val is None:
+            merged.pop(key, None)
+            continue
+        base_val = merged.get(key)
+        if isinstance(base_val, dict) and isinstance(override_val, dict):
+            merged[key] = _deep_merge_dicts(base_val, override_val)
+        else:
+            merged[key] = override_val
+    return merged
+
+
 def merged_effective_contexts(yaml_path: str, contexts_dir: str) -> dict:
     """Return the effective merged contexts dict, mirroring what the engine loads.
 
-    Merge order: external context files are loaded first, then inline contexts
-    from ai-agent.yaml overlay them (inline wins on collision).
+    Merge order: sibling ai-agent.local.yaml is deep-merged over ai-agent.yaml,
+    then external context files fill names absent from that effective inline
+    mapping. This matches load_config(), which applies the local override before
+    _merge_external_contexts().
 
     Deliberate divergence from src/config.py:_merge_external_contexts: production
     calls os.path.expandvars() on each external file's raw text before parsing so
@@ -31,6 +54,45 @@ def merged_effective_contexts(yaml_path: str, contexts_dir: str) -> dict:
         inline = doc.get("contexts") or {}
 
     merged = {}
+
+    for k, v in inline.items():
+        d = dict(v or {})
+        d["_source_file"] = "ai-agent.yaml"
+        merged[k] = d
+
+    stem, ext = os.path.splitext(yaml_path)
+    local_yaml_path = f"{stem}.local{ext}"
+    if os.path.exists(local_yaml_path):
+        try:
+            local_doc = yaml.safe_load(open(local_yaml_path)) or {}
+            local_inline = local_doc.get("contexts") or {} if isinstance(local_doc, dict) else {}
+            if isinstance(local_inline, dict):
+                valid_local_inline = {
+                    key: value
+                    for key, value in local_inline.items()
+                    if value is None or isinstance(value, dict)
+                }
+                invalid_keys = sorted(
+                    str(key)
+                    for key in set(local_inline) - set(valid_local_inline)
+                )
+                if invalid_keys:
+                    logger.warning(
+                        "Skipping non-mapping local context overrides: %s",
+                        ", ".join(invalid_keys),
+                    )
+                merged = _deep_merge_dicts(merged, valid_local_inline)
+                for key in valid_local_inline:
+                    if key in merged and isinstance(merged[key], dict):
+                        merged[key]["_source_file"] = os.path.basename(local_yaml_path)
+        except Exception:
+            # Match runtime behavior: a broken optional override does not take
+            # down base configuration or migration status.
+            logger.warning(
+                "Failed to load/merge local context override %s",
+                local_yaml_path,
+                exc_info=True,
+            )
 
     # Parity fix 1: glob both *.yaml and *.yml — production does the same
     # (src/config.py:_merge_external_contexts lines 1133-1135).
@@ -60,13 +122,11 @@ def merged_effective_contexts(yaml_path: str, contexts_dir: str) -> dict:
         if "prompt" not in ext and "system_prompt" in ext:
             ext["prompt"] = ext.pop("system_prompt")
 
-        ext["_source_file"] = os.path.relpath(f, os.path.dirname(os.path.dirname(f)))
-        merged[name] = ext
-
-    for k, v in inline.items():            # inline wins on collision
-        d = dict(v or {})
-        d["_source_file"] = "ai-agent.yaml"
-        merged[k] = d
+        if name not in merged:
+            ext["_source_file"] = os.path.relpath(
+                f, os.path.dirname(os.path.dirname(f))
+            )
+            merged[name] = ext
 
     return merged
 

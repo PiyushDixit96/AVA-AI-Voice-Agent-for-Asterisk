@@ -75,6 +75,7 @@ from .core.outbound_store import get_outbound_store
 from .utils.audio_capture import AudioCaptureManager
 from src.pipelines.base import LLMResponse
 from src.tools.telephony.hangup_policy import (
+    DEFAULT_HANGUP_MARKERS,
     resolve_hangup_policy,
     text_contains_end_call_intent,
     text_is_short_polite_closing,
@@ -85,6 +86,10 @@ if TYPE_CHECKING:
     from src.tools.context import ToolExecutionContext
 
 logger = get_logger(__name__)
+
+
+class _PipelinePlaybackInterrupted(RuntimeError):
+    """The caller interrupted a pipeline stream while its producer was backpressured."""
 
 # Modular STT uses one canonical, headerless audio bus. Transport-specific
 # audio is converted to this format before it enters the pipeline queue.
@@ -305,6 +310,7 @@ class Engine:
         # call arrived — but a /ready-gating load balancer never routes the
         # first call. The task connects proactively and re-arms on drop.)
         self._local_warm_task: Optional[asyncio.Task] = None
+        self._pipeline_readiness_task: Optional[asyncio.Task] = None
         self._outbound_last_dial_ts: Dict[str, float] = {}
         self._outbound_attempt_meta_by_attempt_id: Dict[str, Dict[str, Any]] = {}
         self._outbound_attempt_meta_by_channel_id: Dict[str, Dict[str, Any]] = {}
@@ -1003,6 +1009,11 @@ class Engine:
                 self._local_warm_task = asyncio.create_task(self._local_warm_loop())
         except Exception:
             logger.debug("Failed to start local warm task", exc_info=True)
+        try:
+            if not self._pipeline_readiness_task:
+                self._pipeline_readiness_task = asyncio.create_task(self._pipeline_readiness_refresh_loop())
+        except Exception:
+            logger.debug("Failed to start pipeline readiness refresh task", exc_info=True)
         logger.info("Engine started and listening for calls.")
 
     def _on_ari_listener_task_done(self, task: "asyncio.Task") -> None:
@@ -1725,6 +1736,26 @@ class Engine:
             raise
         except Exception:
             logger.debug("Local warm loop exited", exc_info=True)
+
+    async def _pipeline_readiness_refresh_loop(self, interval_sec: float = 15.0) -> None:
+        """Refresh local pipeline readiness after Local AI Server startup races."""
+        refresh = getattr(self.pipeline_orchestrator, "refresh_unhealthy_local_pipelines", None)
+        if not callable(refresh):
+            return
+        try:
+            while True:
+                await asyncio.sleep(max(1.0, float(interval_sec)))
+                try:
+                    remaining = int(await refresh())
+                except Exception:
+                    logger.debug("Pipeline readiness refresh pass failed", exc_info=True)
+                    continue
+                if remaining == 0:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Pipeline readiness refresh loop exited", exc_info=True)
 
     async def _outbound_scheduler_loop(self) -> None:
         """Background control-plane: lease leads and originate outbound calls."""
@@ -2556,7 +2587,7 @@ class Engine:
 
         # Stop background loop tasks (warm/probe, retention) so they don't run
         # after shutdown begins.
-        for attr in ("_local_warm_task", "_retention_cleanup_task"):
+        for attr in ("_local_warm_task", "_pipeline_readiness_task", "_retention_cleanup_task"):
             try:
                 t = getattr(self, attr, None)
                 if t and not t.done():
@@ -2665,6 +2696,13 @@ class Engine:
             return None
         return self.provider_kinds.get(provider_name) or provider_name
 
+    def _provider_fallback_is_allowed(self, provider_name: str, allow: set[str]) -> bool:
+        """Match fallback policy by configured instance name or provider kind."""
+        if not allow:
+            return True
+        provider_kind = self._get_provider_kind(provider_name) or provider_name
+        return provider_name in allow or provider_kind in allow
+
     def _assign_session_provider(self, session: CallSession, provider_name: str) -> None:
         session.provider_name = provider_name
         try:
@@ -2741,14 +2779,27 @@ class Engine:
                         logger.error("Deepgram provider requires OpenAI API key in LLM config")
                         continue
 
-                    provider = DeepgramProvider(deepgram_config, self.config.llm, self.on_provider_event)
+                    hangup_policy = resolve_hangup_policy(
+                        getattr(self.config, "tools", None)
+                    )
+                    provider = DeepgramProvider(
+                        deepgram_config,
+                        self.config.llm,
+                        self.on_provider_event,
+                        hangup_policy=hangup_policy,
+                    )
                     self._set_provider_identity(provider, name, kind)
                     # Set session store for turn latency tracking (Milestone 21)
                     provider.set_session_store(self.session_store)
                     self.providers[name] = provider
                     # Per-call factory (supports concurrent calls).
-                    self.provider_factories[name] = lambda cfg=deepgram_config, key=name, p_kind=kind: self._provider_with_identity(
-                        DeepgramProvider(self._clone_config(cfg), self.config.llm, self.on_provider_event),
+                    self.provider_factories[name] = lambda cfg=deepgram_config, policy=hangup_policy, key=name, p_kind=kind: self._provider_with_identity(
+                        DeepgramProvider(
+                            self._clone_config(cfg),
+                            self.config.llm,
+                            self.on_provider_event,
+                            hangup_policy=policy,
+                        ),
                         key,
                         p_kind,
                     )
@@ -3854,6 +3905,10 @@ class Engine:
             except Exception:
                 logger.debug("Audio profile resolution failed", call_id=caller_channel_id, exc_info=True)
 
+            if getattr(session, "context_resolution_error", None):
+                await self._handle_provider_start_failure(session)
+                return
+
             # Per-call override via Asterisk channel var AI_PROVIDER.
             # Values:
             #   - openai_realtime | deepgram → full agent override
@@ -3899,7 +3954,7 @@ class Engine:
             elif ai_provider_value:
                 # Treat as a pipeline name for this call
                 pipeline_resolution = await self._assign_pipeline_to_session(
-                    session, pipeline_name=ai_provider_value
+                    session, pipeline_name=ai_provider_value, strict=True
                 )
                 if pipeline_resolution:
                     logger.info(
@@ -3916,13 +3971,9 @@ class Engine:
                         await self._ensure_pipeline_runner(session, forced=True)
                     except Exception:
                         logger.debug("Failed to start pipeline runner", call_id=caller_channel_id, exc_info=True)
-                elif getattr(self.pipeline_orchestrator, "started", False):
-                    logger.warning(
-                        "Requested pipeline via AI_PROVIDER not found; falling back",
-                        channel_id=caller_channel_id,
-                        requested_pipeline=ai_provider_value,
-                    )
-                    pipeline_resolution = await self._assign_pipeline_to_session(session)
+                else:
+                    await self._handle_pipeline_resolution_failure(session)
+                    return
             else:
                 # Default behavior: check context pipeline first, then provider
                 # If context specifies a pipeline, use modular pipeline even if provider is set
@@ -3942,13 +3993,16 @@ class Engine:
                 if context_pipeline:
                     # Use the pipeline specified by context
                     pipeline_resolution = await self._assign_pipeline_to_session(
-                        session, pipeline_name=context_pipeline
+                        session, pipeline_name=context_pipeline, strict=True
                     )
                     if pipeline_resolution:
                         try:
                             await self._ensure_pipeline_runner(session, forced=True)
                         except Exception:
                             logger.debug("Failed to start pipeline runner", call_id=caller_channel_id, exc_info=True)
+                    else:
+                        await self._handle_pipeline_resolution_failure(session)
+                        return
                 elif session.provider_name and session.provider_name in self.providers:
                     # Skip pipeline resolution if context already set a monolithic provider
                     logger.info(
@@ -5285,6 +5339,62 @@ class Engine:
 
         return mode, timeout_sec
 
+    async def _put_pipeline_stream_chunk(
+        self,
+        call_id: str,
+        stream_id: str,
+        queue: asyncio.Queue,
+        chunk: Optional[bytes],
+        *,
+        wait_slice_sec: float = 0.25,
+    ) -> None:
+        """Put into a live pipeline stream without deadlocking after barge-in.
+
+        ElevenLabs can produce audio faster than telephony consumes it. If
+        barge-in cancels that playback while the queue is full, a bare
+        ``queue.put`` waits forever and prevents the dialog worker from reading
+        later STT finals. Bind each put to the exact stream that owns the queue.
+        """
+        timeout = max(0.05, float(wait_slice_sec))
+        while True:
+            if not self.streaming_playback_manager.is_stream_active(call_id, stream_id):
+                raise _PipelinePlaybackInterrupted(
+                    f"pipeline stream {stream_id} is no longer active"
+                )
+            try:
+                await asyncio.wait_for(queue.put(chunk), timeout=timeout)
+                return
+            except asyncio.TimeoutError:
+                # Re-check ownership/activity on every bounded wait. A healthy
+                # slow consumer keeps draining; a cancelled/replaced stream exits.
+                continue
+
+    @staticmethod
+    def _is_pipeline_farewell_without_tool(
+        user_text: str,
+        assistant_text: str,
+        hangup_policy: Dict[str, Any],
+    ) -> bool:
+        """Require explicit caller end intent plus a spoken assistant farewell."""
+        markers = hangup_policy.get("markers") if isinstance(hangup_policy, dict) else {}
+        markers = markers if isinstance(markers, dict) else {}
+        configured = normalize_marker_list(
+            markers.get("end_call"), DEFAULT_HANGUP_MARKERS["end_call"]
+        )
+        ambiguous = {"thanks", "thank you", "okay", "ok", "no thanks", "no thank you"}
+        explicit_markers = [marker for marker in configured if marker not in ambiguous]
+        has_user_end = (
+            text_contains_end_call_intent(user_text, explicit_markers)
+            or text_is_short_polite_closing(user_text)
+        )
+        farewell_markers = normalize_marker_list(
+            markers.get("assistant_farewell"),
+            DEFAULT_HANGUP_MARKERS["assistant_farewell"],
+        )
+        return has_user_end and text_contains_end_call_intent(
+            assistant_text, farewell_markers
+        )
+
     async def _local_ai_server_llm_request(
         self,
         *,
@@ -6378,13 +6488,41 @@ class Engine:
                 return
             call_id = session.call_id
 
+            # Asterisk can emit a trailing ChannelTalkingStarted a few milliseconds
+            # after streaming playback clears its gating token.  Treating that echo
+            # tail as sustained caller speech leaves the inactivity watchdog paused
+            # forever when Asterisk never follows it with ChannelTalkingFinished.
+            # The media receive paths already drop audio during this same configured
+            # guard window, so keep TALK_DETECT aligned with them.
+            cfg = getattr(self.config, "barge_in", None)
+            try:
+                post_guard_ms = int(getattr(cfg, "post_tts_end_protection_ms", 0)) if cfg else 0
+            except (TypeError, ValueError):
+                post_guard_ms = 0
+            tts_ended_ts = float(getattr(session, "tts_ended_ts", 0.0) or 0.0)
+            if (
+                post_guard_ms > 0
+                and tts_ended_ts > 0
+                and bool(getattr(session, "audio_capture_enabled", True))
+                and not bool(getattr(session, "tts_playing", False))
+            ):
+                elapsed_ms = max(0, int((time.time() - tts_ended_ts) * 1000))
+                if elapsed_ms < post_guard_ms:
+                    logger.info(
+                        "TalkDetect suppressed during post-TTS protection window",
+                        call_id=call_id,
+                        channel_id=channel_id,
+                        elapsed_ms=elapsed_ms,
+                        protection_ms=post_guard_ms,
+                    )
+                    return
+
             # While listening, TALK_DETECT is direct evidence that the caller is
             # present even though there is no playback to interrupt.
             if bool(getattr(session, "audio_capture_enabled", True)) and not bool(getattr(session, "tts_playing", False)):
                 await self._no_input_note_input_state(call_id, True, "asterisk:talk_detect")
                 return
 
-            cfg = getattr(self.config, "barge_in", None)
             if not cfg or not getattr(cfg, "enabled", True):
                 return
 
@@ -6902,7 +7040,9 @@ class Engine:
                                     
                                     # Get fresh session data with complete conversation
                                     current_session = await self.session_store.get_by_call_id(call_id)
-                                    if current_session:
+                                    if current_session and transcript_tool.is_delivery_authorized(
+                                        current_session, email_address
+                                    ):
                                         # Prepare and send transcript email
                                         email_data = transcript_tool._prepare_email_data(
                                             email_address,
@@ -6919,6 +7059,12 @@ class Engine:
                                             "📧 Sent end-of-call transcript",
                                             call_id=call_id,
                                             email=email_address
+                                        )
+                                    elif current_session:
+                                        logger.info(
+                                            "Skipped end-of-call transcript because consent is not active",
+                                            call_id=call_id,
+                                            email=email_address,
                                         )
                                 except Exception as e:
                                     logger.warning(
@@ -8741,7 +8887,7 @@ class Engine:
             call_id = session.call_id
             provider_name = getattr(session, "provider_name", None) or getattr(self.config, "default_provider", "")
             allow = set((getattr(cfg, "provider_fallback_providers", None) or []) or [])
-            if allow and provider_name not in allow:
+            if not self._provider_fallback_is_allowed(provider_name, allow):
                 return
 
             # Only relevant while streaming playback is active (agent is speaking).
@@ -8978,10 +9124,12 @@ class Engine:
 
             # Stop/flush streaming playback first (prevents tail audio).
             # Mark end_reason so cleanup skips remainder flush (avoids oversized RTP packets).
+            playback_position_ms = 0
             try:
                 _sinfo = self.streaming_playback_manager.active_streams.get(call_id)
                 if _sinfo is not None:
                     _sinfo['end_reason'] = 'barge-in'
+                playback_position_ms = int(self.streaming_playback_manager.get_playback_position_ms(call_id))
             except Exception:
                 pass
             try:
@@ -8996,6 +9144,28 @@ class Engine:
                 self._provider_coalesce_buf.pop(call_id, None)
             except Exception:
                 logger.debug("Failed to clear provider stream buffers during barge-in", call_id=call_id, exc_info=True)
+
+            provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
+            # Provider-side egress may be several seconds ahead of telephony playback.
+            # A local VAD interruption must flush that buffer too, otherwise the old
+            # response immediately creates a new platform stream after the local stop.
+            if source in ("local_vad_fallback", "local_vad", "talkdetect"):
+                try:
+                    handle_local_barge = getattr(provider, "handle_local_barge_in", None)
+                    if callable(handle_local_barge):
+                        await handle_local_barge()
+                except Exception:
+                    logger.debug("Provider egress flush failed during local barge-in", call_id=call_id, exc_info=True)
+
+            # Direct-WebSocket realtime providers can generate faster than the
+            # telephony pacer plays.  Give providers an optional hook to truncate
+            # their assistant item to the exact amount sent before the local flush.
+            try:
+                truncate_audio = getattr(provider, "truncate_assistant_audio", None)
+                if callable(truncate_audio) and playback_position_ms > 0:
+                    await truncate_audio(playback_position_ms)
+            except Exception:
+                logger.debug("Provider conversation truncation failed during barge-in", call_id=call_id, exc_info=True)
 
             # Stop any active ARI playbacks (file playback and edge cases).
             try:
@@ -9038,6 +9208,13 @@ class Engine:
                 try:
                     cfg = getattr(self.config, "barge_in", None)
                     suppress_ms = int(getattr(cfg, "provider_output_suppress_ms", 0)) if cfg else 0
+                    provider = (getattr(self, "_call_providers", {}) or {}).get(call_id)
+                    provider_kind = str(getattr(provider, "provider_kind", "") or "").lower()
+                    # Grok server_vad automatically interrupts the old response.
+                    # Suppressing unlabelled AgentAudio here drops the beginning of
+                    # the *new* response when xAI generates it inside this window.
+                    if provider_kind == "grok":
+                        suppress_ms = 0
                     if suppress_ms > 0:
                         sup = session.vad_state.setdefault("output_suppression", {})
                         prev_until = float(sup.get("until_ts", 0.0) or 0.0)
@@ -9135,6 +9312,27 @@ class Engine:
             logger.info("AudioSocket DTMF received", conn_id=conn_id, caller_channel_id=caller_channel_id, digit=digit)
         except Exception as exc:
             logger.error("Error handling AudioSocket DTMF", conn_id=conn_id, error=str(exc), exc_info=True)
+
+    def _externalmedia_continuous_input_mode(
+        self,
+        provider_name: str,
+        capabilities: Any,
+        *,
+        audio_capture_enabled: bool,
+    ) -> str:
+        """Choose whether gated ExternalMedia caller audio is forwarded, silenced, or dropped."""
+        if audio_capture_enabled:
+            return "forward"
+        if self._get_provider_kind(provider_name) == "google_live":
+            return "silence"
+        if bool(
+            capabilities
+            and getattr(capabilities, "requires_continuous_audio", False)
+            and getattr(capabilities, "has_native_vad", False)
+            and getattr(capabilities, "has_native_barge_in", False)
+        ):
+            return "forward"
+        return "drop"
 
     async def _on_rtp_audio(self, caller_channel_id: str, ssrc: int, pcm_16k: bytes) -> None:
         """Route inbound ExternalMedia RTP audio to the active provider.
@@ -9335,9 +9533,9 @@ class Engine:
             except Exception:
                 continuous_input = False
 
-            # For continuous-input providers, forward audio (but respect gating during TTS playback)
-            # OpenAI Realtime has server-side echo cancellation, but we still need to gate during TTS
-            # to prevent the provider from hearing its own audio as "user speech"
+            # For continuous-input providers, preserve caller audio when the provider
+            # owns native VAD/barge-in. Dropping those frames makes interruption
+            # impossible until output gating has already cleared.
             if continuous_input:
                 if not provider or not hasattr(provider, 'send_audio'):
                     if caller_channel_id not in self._provider_start_tasks and not getattr(session, "provider_session_active", False):
@@ -9347,12 +9545,13 @@ class Engine:
                 # Preserve original inbound audio for local barge-in fallback checks (never run VAD on silence-substituted frames).
                 pcm_for_barge_in = pcm_16k
 
-                # CRITICAL: Check if audio capture is disabled (TTS playing)
-                # For Google Live: Send silence frames to maintain stream continuity (like AudioSocket)
-                # For OpenAI/Deepgram: Can drop audio (they handle gaps gracefully)
-                needs_gating = self._get_provider_kind(provider_name) == "google_live"
-                
-                if needs_gating and not session.audio_capture_enabled:
+                gating_mode = self._externalmedia_continuous_input_mode(
+                    provider_name,
+                    capabilities,
+                    audio_capture_enabled=bool(session.audio_capture_enabled),
+                )
+
+                if gating_mode == "silence":
                     # Send SILENCE instead of dropping to maintain Google Live's stream
                     logger.debug(
                         "🔇 GATING ACTIVE - Sending silence frame for Google Live (TTS playing)",
@@ -9361,9 +9560,9 @@ class Engine:
                     )
                     # Replace audio with silence (zero-filled PCM16)
                     pcm_16k = b'\x00' * len(pcm_16k)
-                elif not needs_gating and not session.audio_capture_enabled:
-                    # For other providers, do not forward audio during TTS, but still run
-                    # local barge-in detection on the real inbound frames so interruptions work.
+                elif gating_mode == "drop":
+                    # Providers without native interruption ownership stay gated and
+                    # use AVA's conservative local barge-in fallback.
                     logger.debug(
                         "Dropping RTP audio for continuous provider during TTS playback",
                         call_id=caller_channel_id,
@@ -9384,6 +9583,12 @@ class Engine:
                             exc_info=True,
                         )
                     return
+                elif not session.audio_capture_enabled:
+                    logger.debug(
+                        "Forwarding RTP audio during provider output for native barge-in",
+                        call_id=caller_channel_id,
+                        provider=provider_name,
+                    )
                 if not getattr(session, "provider_session_active", False):
                     return
                 # Encode audio for provider (same as AudioSocket path)
@@ -9641,7 +9846,20 @@ class Engine:
     def _build_grok_config(self, provider_cfg: Dict[str, Any], provider_key: str = "grok") -> Optional[GrokProviderConfig]:
         """Construct a GrokProviderConfig from raw provider settings."""
         try:
-            merged = dict(provider_cfg)
+            # Named Grok instances created by the Admin UI commonly store only
+            # identity/credential fields.  Inherit the canonical `grok` template
+            # so voice/audio/turn-detection behavior does not silently fall back
+            # to dataclass defaults (notably the too-short 200 ms VAD cutoff).
+            merged: Dict[str, Any] = {}
+            if provider_key != "grok":
+                try:
+                    providers_cfg = getattr(self.config, "providers", {}) or {}
+                    base_grok = providers_cfg.get("grok") if hasattr(providers_cfg, "get") else None
+                    if isinstance(base_grok, dict):
+                        merged.update(base_grok)
+                except Exception:
+                    logger.debug("Failed to inherit base Grok provider config", provider=provider_key, exc_info=True)
+            merged.update(dict(provider_cfg))
 
             merged['api_key'] = resolve_secret_value(
                 merged,
@@ -10703,7 +10921,7 @@ class Engine:
                 # or sentinel is in place. The lifecycle observer then keeps raw
                 # VAD/watchdog output state active until those buffers drain.
                 await self._note_provider_output_end(call_id, session)
-                
+
                 # Signal farewell done event if we're waiting for hangup
                 farewell_key = f"farewell_done_{call_id}"
                 if hasattr(self, '_farewell_done_events') and farewell_key in self._farewell_done_events:
@@ -12258,6 +12476,12 @@ class Engine:
                                 # Record time when a final transcript arrives
                                 self._last_transcript_ts[call_id] = time.time()
                                 transcript_queue.put_nowait(final)
+                                logger.debug(
+                                    "Pipeline STT final enqueued for dialog",
+                                    call_id=call_id,
+                                    transcript_preview=str(final or "")[:80],
+                                    queue_depth=transcript_queue.qsize(),
+                                )
                             except asyncio.QueueFull:
                                 try:
                                     transcript_queue.get_nowait()
@@ -12466,7 +12690,9 @@ class Engine:
                                                             )
                                                     except Exception:
                                                         pass
-                                                await stream_q.put(tts_chunk)
+                                                await self._put_pipeline_stream_chunk(
+                                                    call_id, stream_id, stream_q, tts_chunk
+                                                )
 
                             # Flush remaining sentence buffer
                             remainder = sentence_buffer.strip()
@@ -12479,13 +12705,14 @@ class Engine:
                                             first_tts_ts = time.time()
                                             turn_latency_ms = (first_tts_ts - turn_start_time) * 1000
                                             session.turn_latencies_ms.append(turn_latency_ms)
-                                        await stream_q.put(tts_chunk)
+                                        await self._put_pipeline_stream_chunk(
+                                            call_id, stream_id, stream_q, tts_chunk
+                                        )
 
                             # End-of-segment sentinel
-                            try:
-                                stream_q.put_nowait(None)
-                            except asyncio.QueueFull:
-                                asyncio.create_task(stream_q.put(None))
+                            await self._put_pipeline_stream_chunk(
+                                call_id, stream_id, stream_q, None
+                            )
                             try:
                                 if t_start is not None:
                                     _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(
@@ -12494,6 +12721,17 @@ class Engine:
                             except Exception:
                                 pass
 
+                        except _PipelinePlaybackInterrupted:
+                            logger.info(
+                                "Pipeline streaming turn interrupted; discarding remaining TTS",
+                                call_id=call_id,
+                                stream_id=stream_id,
+                            )
+                            try:
+                                await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                            except Exception:
+                                pass
+                            return
                         except Exception:
                             logger.error(
                                 "Pipeline streaming overlap failed; falling through to serial path",
@@ -12535,6 +12773,22 @@ class Engine:
                                 # Jump to tool execution (reuse serial path's tool handling)
                                 # by setting response_text and tool_calls, then breaking out
                             else:
+                                tools_cfg = getattr(self.config, "tools", {}) or {}
+                                if self._is_pipeline_farewell_without_tool(
+                                    transcript_text,
+                                    response_text,
+                                    resolve_hangup_policy(tools_cfg),
+                                ):
+                                    logger.warning(
+                                        "Pipeline omitted hangup_call after farewell; applying terminal fallback",
+                                        call_id=call_id,
+                                        pipeline=pipeline_label,
+                                    )
+                                    await self._terminate_call_after_audio(
+                                        call_id,
+                                        reason="pipeline_farewell_without_tool",
+                                        call_outcome="agent_hangup",
+                                    )
                                 return
 
                             # Fall through to tool execution below if tool calls were found
@@ -12783,18 +13037,30 @@ class Engine:
                                                 _TURN_STT_TO_TTS.labels(pipeline_label, provider_label).observe(max(0.0, first_tts_ts - t_start))
                                         except Exception:
                                             pass
-                                    await stream_q.put(tts_chunk)
+                                    await self._put_pipeline_stream_chunk(
+                                        call_id, stream_id, stream_q, tts_chunk
+                                    )
 
                                 # End-of-segment sentinel
-                                try:
-                                    stream_q.put_nowait(None)
-                                except asyncio.QueueFull:
-                                    asyncio.create_task(stream_q.put(None))
+                                await self._put_pipeline_stream_chunk(
+                                    call_id, stream_id, stream_q, None
+                                )
                                 try:
                                     if playback_id and t_start is not None:
                                         _TURN_RESPONSE_SECONDS.labels(pipeline_label, provider_label).observe(max(0.0, time.time() - t_start))
                                 except Exception:
                                     pass
+                            except _PipelinePlaybackInterrupted:
+                                logger.info(
+                                    "Pipeline streaming turn interrupted; discarding remaining TTS",
+                                    call_id=call_id,
+                                    stream_id=stream_id,
+                                )
+                                try:
+                                    await self.streaming_playback_manager.stop_streaming_playback(call_id)
+                                except Exception:
+                                    pass
+                                return
                             except Exception:
                                 logger.error("Pipeline streaming playback failed; falling back to file playback", call_id=call_id, exc_info=True)
                                 try:
@@ -12878,6 +13144,25 @@ class Engine:
                                         )
                                 except Exception:
                                     logger.error("Pipeline playback exception", call_id=call_id, exc_info=True)
+
+                    if response_text and not tool_calls:
+                        tools_cfg = getattr(self.config, "tools", {}) or {}
+                        if self._is_pipeline_farewell_without_tool(
+                            transcript_text,
+                            response_text,
+                            resolve_hangup_policy(tools_cfg),
+                        ):
+                            logger.warning(
+                                "Pipeline omitted hangup_call after farewell; applying terminal fallback",
+                                call_id=call_id,
+                                pipeline=pipeline_label,
+                            )
+                            await self._terminate_call_after_audio(
+                                call_id,
+                                reason="pipeline_farewell_without_tool",
+                                call_outcome="agent_hangup",
+                            )
+                            return
 
                     # 2. Execute Tools (if any)
                     if tool_calls:
@@ -13283,8 +13568,34 @@ class Engine:
                             await schedule_flush()
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    logger.error(
+                        "Pipeline dialog worker crashed while consuming transcript",
+                        call_id=call_id,
+                        pending_segments=len(pending_segments),
+                        exc_info=True,
+                    )
+                    raise
                 finally:
                     await cancel_flush()
+
+            async def dialog_supervisor() -> None:
+                restart_count = 0
+                while True:
+                    try:
+                        await dialog_worker()
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        restart_count += 1
+                        logger.warning(
+                            "Restarting pipeline dialog consumer after unexpected exit",
+                            call_id=call_id,
+                            restart_count=restart_count,
+                        )
+                        # Yield so a persistent failure cannot spin the event loop.
+                        await asyncio.sleep(min(0.1 * restart_count, 1.0))
 
             ingest_task = asyncio.create_task(ingest_audio())
 
@@ -13303,7 +13614,7 @@ class Engine:
                     )
                     stt_send_task = asyncio.create_task(stt_sender())
                     stt_recv_task = asyncio.create_task(stt_receiver())
-                    dialog_task = asyncio.create_task(dialog_worker())
+                    dialog_task = asyncio.create_task(dialog_supervisor())
 
                     if stt_send_task:
                         await stt_send_task
@@ -13325,7 +13636,7 @@ class Engine:
                         await pipeline.stt_adapter.stop_stream(call_id)
             else:
                 stt_task = asyncio.create_task(stt_worker())
-                dialog_task = asyncio.create_task(dialog_worker())
+                dialog_task = asyncio.create_task(dialog_supervisor())
 
                 try:
                     await dialog_task
@@ -13571,6 +13882,35 @@ class Engine:
             context_name=session.context_name,
             routing_method=session.routing_method,
         )
+
+        # A YAML context omitted from an existing authoritative agents.db is not
+        # safe to run as a generic/default provider. It may be stale migration
+        # drift or an intentionally deleted/deactivated agent. Fail closed and
+        # direct the operator to the explicit reconciliation flow; never resurrect
+        # the YAML definition implicitly.
+        shadow_check = getattr(
+            self.transport_orchestrator,
+            "yaml_context_shadowed_by_agent_db",
+            None,
+        )
+        if resolved_context and callable(shadow_check) and shadow_check(
+            resolved_context, session.routing_method
+        ):
+            message = (
+                f"context_resolution_failed: {resolved_context}: YAML context is not active "
+                "in authoritative agents.db; reconcile or restore it in the Agents UI"
+            )
+            session.context_resolution_error = message
+            session.error_message = message
+            await self._save_session(session)
+            logger.error(
+                "Requested YAML context is shadowed by authoritative agents.db",
+                call_id=session.call_id,
+                context_name=resolved_context,
+                routing_method=session.routing_method,
+                remediation="Use Agents > Migration Status > Reconcile YAML changes",
+            )
+            return
 
         # Resolve the engine-owned inactivity policy before provider/pipeline
         # selection can return early. This keeps agents.db and headless YAML calls
@@ -14635,11 +14975,21 @@ class Engine:
         self,
         session: CallSession,
         pipeline_name: Optional[str] = None,
+        *,
+        strict: bool = False,
     ) -> Optional[PipelineResolution]:
         """Resolve modular pipeline components for a session and persist metadata."""
         if not getattr(self, "pipeline_orchestrator", None):
+            if strict:
+                await self._record_pipeline_resolution_failure(
+                    session, pipeline_name, "pipeline orchestrator is unavailable"
+                )
             return None
         if not self.pipeline_orchestrator.enabled:
+            if strict:
+                await self._record_pipeline_resolution_failure(
+                    session, pipeline_name, "pipeline orchestrator is disabled"
+                )
             return None
         # If a monolithic provider is selected for this session (e.g., google_live),
         # do not auto-attach the active pipeline unless explicitly requested.
@@ -14658,6 +15008,8 @@ class Engine:
                 error=str(exc),
                 exc_info=True,
             )
+            if strict:
+                await self._record_pipeline_resolution_failure(session, pipeline_name, str(exc))
             return None
         except Exception as exc:
             logger.error(
@@ -14667,6 +15019,8 @@ class Engine:
                 error=str(exc),
                 exc_info=True,
             )
+            if strict:
+                await self._record_pipeline_resolution_failure(session, pipeline_name, str(exc))
             return None
  
         if not resolution:
@@ -14675,6 +15029,10 @@ class Engine:
                 call_id=session.call_id,
                 requested_pipeline=pipeline_name,
             )
+            if strict:
+                await self._record_pipeline_resolution_failure(
+                    session, pipeline_name, "pipeline resolution returned no result"
+                )
             return None
  
         component_summary = resolution.component_summary()
@@ -14741,6 +15099,29 @@ class Engine:
                 )
  
         return resolution
+
+    async def _record_pipeline_resolution_failure(
+        self,
+        session: CallSession,
+        pipeline_name: Optional[str],
+        detail: str,
+    ) -> None:
+        """Persist an explicit pipeline-selection failure without changing providers."""
+        requested = pipeline_name or getattr(session, "pipeline_name", None) or "<default>"
+        message = f"pipeline_resolution_failed: {requested}: {detail}"
+        session.pipeline_resolution_error = message
+        session.error_message = message
+        await self._save_session(session)
+        logger.error(
+            "Explicit pipeline selection unavailable",
+            call_id=session.call_id,
+            requested_pipeline=requested,
+            error=detail,
+        )
+
+    async def _handle_pipeline_resolution_failure(self, session: CallSession) -> None:
+        """End an already-answered call after an explicit pipeline cannot start."""
+        await self._handle_provider_start_failure(session)
  
     async def _ensure_provider_session_started(self, call_id: str) -> None:
         """Single-flight wrapper around _start_provider_session (prevents duplicate concurrent starts)."""
@@ -14892,8 +15273,12 @@ class Engine:
             if getattr(self.pipeline_orchestrator, "enabled", False):
                 if getattr(session, "pipeline_name", None):
                     pipeline_resolution = await self._assign_pipeline_to_session(
-                        session, pipeline_name=session.pipeline_name
+                        session, pipeline_name=session.pipeline_name, strict=True
                     )
+
+            if getattr(session, "pipeline_resolution_error", None):
+                await self._handle_pipeline_resolution_failure(session)
+                return
 
             # Pipeline-only mode: if a pipeline is selected for this call, do not start
             # the legacy provider session or play the provider-managed greeting.
@@ -15247,11 +15632,112 @@ class Engine:
             # so on failure it stays open and SILENT (dead air) until the caller hangs
             # up. Unless configured to leave the line open, play a best-effort error
             # prompt and hang up so the caller is not stranded.
-            on_failure = getattr(self.config, "on_provider_failure", "announce_hangup")
-            if on_failure != "leave_open":
-                channel_id = getattr(_sess, "caller_channel_id", None) if _sess is not None else None
-                if channel_id:
-                    await self._announce_provider_failure_and_hangup(call_id, channel_id)
+            if _sess is not None:
+                await self._handle_provider_start_failure(_sess)
+
+    async def _handle_provider_start_failure(self, session: CallSession) -> None:
+        """Apply the configured, idempotent recovery action for provider startup failure."""
+        if getattr(session, "provider_failure_action_started", False):
+            logger.debug("Provider-failure action already started", call_id=session.call_id)
+            return
+
+        session.provider_failure_action_started = True
+        await self._save_session(session)
+        on_failure = getattr(self.config, "on_provider_failure", "announce_hangup")
+
+        if on_failure == "leave_open":
+            return
+
+        if on_failure == "dialplan_redirect":
+            context = str(
+                getattr(self.config, "provider_failure_redirect_context", "") or ""
+            ).strip()
+            extension = str(
+                getattr(self.config, "provider_failure_redirect_extension", "s") or "s"
+            ).strip()
+            priority = int(
+                getattr(self.config, "provider_failure_redirect_priority", 1) or 1
+            )
+            if context:
+                try:
+                    target_exists = await self.ari_client.dialplan_target_exists(
+                        session.caller_channel_id,
+                        context=context,
+                        extension=extension,
+                        priority=priority,
+                    )
+                except Exception:
+                    target_exists = False
+                    logger.warning(
+                        "Provider-failure dialplan target validation raised",
+                        call_id=session.call_id,
+                        context=context,
+                        extension=extension,
+                        priority=priority,
+                        exc_info=True,
+                    )
+                if not target_exists:
+                    logger.error(
+                        "Provider-failure dialplan target does not exist; announcing and hanging up",
+                        call_id=session.call_id,
+                        context=context,
+                        extension=extension,
+                        priority=priority,
+                    )
+                else:
+                    session.transfer_active = True
+                    session.transfer_state = "provider_failure_redirect"
+                    session.transfer_target = f"{context},{extension},{priority}"
+                    await self._save_session(session)
+                    try:
+                        redirected = await self.ari_client.continue_in_dialplan(
+                            session.caller_channel_id,
+                            context=context,
+                            extension=extension,
+                            priority=priority,
+                        )
+                    except Exception:
+                        redirected = False
+                        logger.warning(
+                            "Provider-failure dialplan redirect raised",
+                            call_id=session.call_id,
+                            context=context,
+                            extension=extension,
+                            priority=priority,
+                            exc_info=True,
+                        )
+                    if redirected:
+                        logger.info(
+                            "Provider-failure dialplan redirect initiated",
+                            call_id=session.call_id,
+                            context=context,
+                            extension=extension,
+                            priority=priority,
+                        )
+                        return
+
+                    # Continue failed: restore cleanup ownership before using the
+                    # safe announcement/hangup fallback.
+                    session.transfer_active = False
+                    session.transfer_state = None
+                    session.transfer_target = None
+                    await self._save_session(session)
+                    logger.error(
+                        "Provider-failure dialplan redirect failed; announcing and hanging up",
+                        call_id=session.call_id,
+                        context=context,
+                        extension=extension,
+                        priority=priority,
+                    )
+            else:
+                logger.error(
+                    "Provider-failure dialplan redirect has no context; announcing and hanging up",
+                    call_id=session.call_id,
+                )
+
+        await self._announce_provider_failure_and_hangup(
+            session.call_id, session.caller_channel_id
+        )
 
     async def _announce_provider_failure_and_hangup(self, call_id: str, channel_id: str) -> None:
         """HIGH-3: best-effort error prompt to the caller, then hang up the channel.
@@ -16339,6 +16825,29 @@ class Engine:
             pass  # Don't fail health endpoint if warning computation fails
         return warnings
 
+    def _pipeline_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        orchestrator = getattr(self, "pipeline_orchestrator", None)
+        status_fn = getattr(orchestrator, "pipeline_status", None)
+        if callable(status_fn):
+            try:
+                return dict(status_fn())
+            except Exception:
+                logger.debug("Failed to build pipeline readiness snapshot", exc_info=True)
+        return {}
+
+    def _pipeline_is_ready(self, pipeline_name: Optional[str]) -> bool:
+        orchestrator = getattr(self, "pipeline_orchestrator", None)
+        ready_fn = getattr(orchestrator, "is_pipeline_ready", None)
+        if callable(ready_fn):
+            try:
+                return bool(ready_fn(pipeline_name))
+            except Exception:
+                logger.debug("Failed to resolve pipeline readiness", pipeline=pipeline_name, exc_info=True)
+                return False
+        # Compatibility for lightweight test/runtime stubs that predate the
+        # detailed readiness contract.
+        return bool(orchestrator and getattr(orchestrator, "started", False))
+
     async def _build_live_status_components(self) -> Dict[str, Dict[str, Any]]:
         """Build Admin UI live-status components from the engine's in-memory state."""
         providers_info: Dict[str, Dict[str, Any]] = {}
@@ -16371,7 +16880,7 @@ class Engine:
             except Exception:
                 default_ready = False
         elif self.config and hasattr(self.config, "pipelines") and default_target in (self.config.pipelines or {}):
-            default_ready = bool(getattr(self, "pipeline_orchestrator", None) and self.pipeline_orchestrator.started)
+            default_ready = self._pipeline_is_ready(default_target)
 
         ari_connected = bool(self.ari_client and self.ari_client.running)
         if getattr(self.config, "audio_transport", None) == "audiosocket":
@@ -16390,7 +16899,13 @@ class Engine:
             conversation_summary = {}
 
         is_ready = ari_connected and transport_ok and default_ready
-        config_warnings = self._compute_nat_warnings()
+        pipeline_status = self._pipeline_status_snapshot()
+        pipeline_warnings = [
+            f"{name}: {details.get('error') or 'connectivity validation failed'}"
+            for name, details in pipeline_status.items()
+            if not details.get("valid") or not details.get("healthy")
+        ]
+        config_warnings = [*self._compute_nat_warnings(), *pipeline_warnings]
         warnings = list(config_warnings)
         provider_warning_severity = "info" if is_ready else "degraded"
         if provider_warnings:
@@ -16419,6 +16934,7 @@ class Engine:
                     "llm": getattr(cfg, "llm", None),
                     "tts": getattr(cfg, "tts", None),
                     "tools": getattr(cfg, "tools", None),
+                    **pipeline_status.get(name, {}),
                 }
                 for name, cfg in (getattr(self.config, "pipelines", {}) or {}).items()
             },
@@ -16467,13 +16983,15 @@ class Engine:
         try:
             # Gather pipeline details
             pipelines_info = {}
+            pipeline_status = self._pipeline_status_snapshot()
             if self.config and hasattr(self.config, 'pipelines'):
                 for p_name, p_cfg in self.config.pipelines.items():
                     pipelines_info[p_name] = {
                         "stt": p_cfg.stt,
                         "llm": p_cfg.llm,
                         "tts": p_cfg.tts,
-                        "tools": p_cfg.tools
+                        "tools": p_cfg.tools,
+                        **pipeline_status.get(p_name, {}),
                     }
 
             # Gather provider details - only mark ready if is_ready() explicitly returns True
@@ -16512,7 +17030,7 @@ class Engine:
                 except Exception:
                     default_ready = False
             elif self.config and hasattr(self.config, "pipelines") and default_target in (self.config.pipelines or {}):
-                default_ready = bool(getattr(self, "pipeline_orchestrator", None) and self.pipeline_orchestrator.started)
+                default_ready = self._pipeline_is_ready(default_target)
             ari_connected = bool(self.ari_client and self.ari_client.running)
             audiosocket_listening = self.audio_socket_server is not None if self.config.audio_transport == 'audiosocket' else True
             is_ready = ari_connected and audiosocket_listening and default_ready
@@ -16558,7 +17076,14 @@ class Engine:
                     "rtp_port": getattr(self.config.external_media, 'rtp_port', None) if self.config.external_media else None,
                     "port_range": getattr(self.config.external_media, 'port_range', None) if self.config.external_media else None,
                 },
-                "config_warnings": self._compute_nat_warnings(),
+                "config_warnings": [
+                    *self._compute_nat_warnings(),
+                    *[
+                        f"{name}: {details.get('error') or 'connectivity validation failed'}"
+                        for name, details in pipeline_status.items()
+                        if not details.get("valid") or not details.get("healthy")
+                    ],
+                ],
                 "audiosocket_listening": audiosocket_listening,
                 "conversation": {
                     "gating_active": conversation_summary.get("gating_active", 0),
@@ -16607,7 +17132,7 @@ class Engine:
                 except Exception:
                     provider_ok = True
             elif self.config and hasattr(self.config, "pipelines") and default_target in (self.config.pipelines or {}):
-                pipeline_ok = bool(getattr(self, "pipeline_orchestrator", None) and self.pipeline_orchestrator.started)
+                pipeline_ok = self._pipeline_is_ready(default_target)
 
             default_ok = provider_ok or pipeline_ok
             is_ready = ari_connected and transport_ok and default_ok

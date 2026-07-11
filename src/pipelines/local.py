@@ -61,6 +61,9 @@ class _LocalSessionState:
     result_queue: Optional[asyncio.Queue] = None
     receiver_task: Optional[asyncio.Task] = None
     send_lock: Optional[asyncio.Lock] = None
+    stopping: bool = False
+    receiver_restart_count: int = 0
+    last_final_result_ts: float = 0.0
 
 
 class _LocalAdapterBase:
@@ -337,8 +340,8 @@ class _LocalAdapterBase:
                     attempt=attempt,
                     error=str(exc),
                 )
-                # Remove stale session so next attempt reconnects
-                self._sessions.pop(call_id, None)
+                # Keep the stale session indexed until _reconnect_session()
+                # transfers its streaming queue/lock to the new WebSocket.
                 if attempt < max_attempts:
                     delay = _RECONNECT_DELAY_BASE_SEC * (2 ** (attempt - 1))
                     await asyncio.sleep(delay)
@@ -388,9 +391,32 @@ class _LocalAdapterBase:
                 )
                 return existing
             
+            # Preserve streaming state across the new WebSocket. iter_results()
+            # waits on the original queue for the lifetime of the dialog worker,
+            # so replacing it here would silently orphan all post-reconnect STT
+            # finals.
+            result_queue = existing.result_queue if existing else None
+            send_lock = existing.send_lock if existing else None
+            stopping = existing.stopping if existing else False
+            receiver_restart_count = existing.receiver_restart_count if existing else 0
+            last_final_result_ts = existing.last_final_result_ts if existing else 0.0
+
             # Clean up stale session
             if existing:
                 self._sessions.pop(call_id, None)
+                if existing.receiver_task and not existing.receiver_task.done():
+                    existing.receiver_task.cancel()
+                    try:
+                        await existing.receiver_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.debug(
+                            "Local adapter receiver cleanup failed during reconnect",
+                            component=self.component_key,
+                            call_id=call_id,
+                            exc_info=True,
+                        )
                 try:
                     await existing.websocket.close()
                 except Exception:
@@ -408,6 +434,13 @@ class _LocalAdapterBase:
             session = self._sessions.get(call_id)
             if not session or session.websocket.state.name != "OPEN":
                 raise RuntimeError(f"Failed to reconnect session for call {call_id}")
+
+            if result_queue is not None:
+                session.result_queue = result_queue
+                session.send_lock = send_lock
+                session.stopping = stopping
+                session.receiver_restart_count = receiver_restart_count
+                session.last_final_result_ts = last_final_result_ts
             
             logger.info(
                 "Local adapter session reconnected successfully",
@@ -562,16 +595,13 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             )
         runtime_options = options or {}
         session = await self._ensure_session(call_id, runtime_options)
+        session.stopping = False
         if session.send_lock is None:
             session.send_lock = asyncio.Lock()
         if session.result_queue is None:
             maxsize = int(runtime_options.get("stream_queue_maxsize", 16))
             session.result_queue = asyncio.Queue(max(maxsize, 1))
-        if session.receiver_task and not session.receiver_task.done():
-            return
-        session.receiver_task = asyncio.create_task(
-            self._stream_receive_loop(session, runtime_options)
-        )
+        self._ensure_stream_receiver(session, runtime_options, reason="stream_start")
         logger.debug(
             "Local STT streaming started",
             component=self.component_key,
@@ -612,6 +642,11 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 call_id=call_id,
             )
             return  # Skip this audio frame rather than crash the call
+
+        # A transient receive-loop failure must not permanently end the dialog
+        # while the send side continues feeding audio. Restart it on the same
+        # healthy WebSocket before sending the next chunk.
+        self._ensure_stream_receiver(session, session.options, reason="audio_send")
         
         pcm16 = self._to_pcm16_16k(audio, fmt, call_id=call_id)
         if not pcm16:
@@ -649,18 +684,18 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         
         try:
             async with session.send_lock:
-                # Check connection state before sending
-                if session.websocket.state.name != "OPEN":
-                    logger.debug(
-                        "WebSocket not open, attempting reconnection for STT audio",
-                        component=self.component_key,
-                        call_id=call_id,
-                        ws_state=session.websocket.state.name,
-                    )
-                    # Use retry logic
-                    await self._send_json_with_retry(call_id, payload, session.options)
-                else:
-                    await self._send_json(session, payload)
+                await self._send_json_with_retry(call_id, payload, session.options)
+
+            # Reconnection replaces the session object but deliberately keeps
+            # the queue consumed by iter_results(). Bind a receiver to the new
+            # WebSocket before the next STT result arrives.
+            active_session = self._sessions.get(call_id)
+            if active_session is not None:
+                self._ensure_stream_receiver(
+                    active_session,
+                    active_session.options,
+                    reason="session_reconnect",
+                )
         except (ConnectionClosed, ConnectionClosedError) as exc:
             logger.warning(
                 "STT send_audio connection closed, will retry on next audio",
@@ -668,8 +703,6 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                 call_id=call_id,
                 error=str(exc),
             )
-            # Remove stale session so next call can reconnect
-            self._sessions.pop(call_id, None)
             return  # Don't crash - skip this frame
         except Exception as exc:
             logger.warning(
@@ -703,6 +736,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         session = self._sessions.get(call_id)
         if not session:
             return
+        session.stopping = True
         if session.receiver_task:
             session.receiver_task.cancel()
             try:
@@ -725,6 +759,32 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
         session.result_queue = None
         session.send_lock = None
 
+    def _ensure_stream_receiver(
+        self,
+        session: _LocalSessionState,
+        options: Dict[str, Any],
+        *,
+        reason: str,
+    ) -> None:
+        """Start or recover the per-call STT result receiver."""
+        if session.stopping or session.result_queue is None:
+            return
+        task = session.receiver_task
+        if task and not task.done():
+            return
+        if task is not None:
+            session.receiver_restart_count += 1
+            logger.warning(
+                "Restarting local STT result receiver after unexpected exit",
+                component=self.component_key,
+                call_id=session.call_id,
+                reason=reason,
+                restart_count=session.receiver_restart_count,
+            )
+        session.receiver_task = asyncio.create_task(
+            self._stream_receive_loop(session, options)
+        )
+
     async def close_call(self, call_id: str) -> None:
         await self.stop_stream(call_id)
         self._resample_states.pop(call_id, None)
@@ -740,6 +800,7 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
             return
         timeout = options.get("streaming_result_timeout_sec")
         timeout_val = float(timeout) if timeout is not None else None
+        exit_reason = "unknown"
         try:
             while True:
                 try:
@@ -759,26 +820,48 @@ class LocalSTTAdapter(_LocalAdapterBase, STTComponent):
                     )
                     continue
                 text = (message.get("text") or "")
+                session.last_final_result_ts = time.time()
+                logger.info(
+                    "Local STT final received by adapter",
+                    component=self.component_key,
+                    call_id=session.call_id,
+                    transcript_preview=text[:80],
+                    receiver_restart_count=session.receiver_restart_count,
+                )
                 try:
                     queue.put_nowait(text)
                 except asyncio.QueueFull:
                     await queue.put(text)
         except asyncio.CancelledError:
-            pass
-        except ConnectionClosed:
-            pass
-        except Exception:
-            logger.debug(
-                "Local STT streaming receive loop error",
+            exit_reason = "cancelled"
+        except ConnectionClosed as exc:
+            exit_reason = f"connection_closed:{getattr(exc, 'code', None)}"
+        except Exception as exc:
+            exit_reason = f"error:{type(exc).__name__}"
+            logger.warning(
+                "Local STT streaming receive loop exited unexpectedly",
                 component=self.component_key,
                 call_id=session.call_id,
+                error=str(exc),
                 exc_info=True,
             )
         finally:
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+            # Only an intentional stop owns the end-of-stream sentinel. An
+            # unexpected receiver exit is recoverable and must not terminate the
+            # engine's dialog worker while audio sending remains active.
+            if session.stopping:
+                try:
+                    queue.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+            else:
+                logger.warning(
+                    "Local STT result receiver stopped without stream shutdown",
+                    component=self.component_key,
+                    call_id=session.call_id,
+                    reason=exit_reason,
+                    restart_on_next_audio=True,
+                )
 
     def _to_pcm16_16k(self, audio: bytes, fmt: str, call_id: str = "") -> bytes:
         if not audio:

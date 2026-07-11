@@ -15,6 +15,58 @@ CLI_INSTALL_PATH="${AAVA_UPDATE_CLI_INSTALL_PATH:-}" # optional absolute host pa
 BUILD_CLI_FROM_SOURCE="${AAVA_UPDATE_BUILD_CLI_FROM_SOURCE:-false}" # true|false
 KEEP_JOB_LOGS="${AAVA_UPDATE_KEEP_JOB_LOGS:-10}" # keep last N job logs
 
+drop_to_project_owner() {
+  if [ "$(id -u)" -ne 0 ] || [ ! -d "${PROJECT_ROOT}" ]; then
+    return 0
+  fi
+
+  local project_uid project_gid socket_gid user_name primary_group socket_group
+  project_uid="$(stat -c '%u' "${PROJECT_ROOT}")"
+  project_gid="$(stat -c '%g' "${PROJECT_ROOT}")"
+  if [ "${project_uid}" = "0" ]; then
+    return 0
+  fi
+
+  # Older updater images wrote this tree as root. Repair that state while we
+  # still have privileges so the project owner can create locks, job files,
+  # backups, and replacement CLI binaries after the re-exec. Refuse a
+  # top-level symlink rather than recursively changing an unrelated path.
+  if [ -L "${PROJECT_ROOT}/.agent" ]; then
+    echo "ERR: refusing to repair symlinked updater state: ${PROJECT_ROOT}/.agent" >&2
+    return 2
+  fi
+  mkdir -p "${PROJECT_ROOT}/.agent"
+  chown -R --no-dereference "${project_uid}:${project_gid}" "${PROJECT_ROOT}/.agent"
+
+  primary_group="$(getent group "${project_gid}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
+  if [ -z "${primary_group}" ]; then
+    primary_group="aava-project-${project_gid}"
+    groupadd -g "${project_gid}" "${primary_group}"
+  fi
+
+  user_name="$(getent passwd "${project_uid}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
+  if [ -z "${user_name}" ]; then
+    user_name="aava-updater-${project_uid}"
+    useradd --no-create-home -u "${project_uid}" -g "${project_gid}" -s /bin/bash "${user_name}"
+  fi
+
+  if [ -S /var/run/docker.sock ]; then
+    socket_gid="$(stat -c '%g' /var/run/docker.sock)"
+    if [ "${socket_gid}" != "${project_gid}" ]; then
+      socket_group="$(getent group "${socket_gid}" 2>/dev/null | cut -d: -f1 | head -n 1 || true)"
+      if [ -z "${socket_group}" ]; then
+        socket_group="aava-docker-${socket_gid}"
+        groupadd -g "${socket_gid}" "${socket_group}"
+      fi
+      usermod -aG "${socket_group}" "${user_name}"
+    fi
+  fi
+
+  exec gosu "${user_name}" "$0" "$@"
+}
+
+drop_to_project_owner "$@"
+
 UPDATES_DIR="${PROJECT_ROOT}/.agent/updates"
 JOBS_DIR="${UPDATES_DIR}/jobs"
 BIN_DIR="${PROJECT_ROOT}/.agent/bin"
@@ -65,7 +117,9 @@ is_truthy() {
 }
 
 query_ai_engine_active_calls() {
-  docker exec ai_engine python3 - <<'PY'
+  # -i is required because the probe script is supplied on stdin. Without it,
+  # python receives an empty program and exits successfully with no count.
+  docker exec -i ai_engine python3 - <<'PY'
 import json
 import os
 import sys
@@ -179,8 +233,12 @@ sync_agent_cli() {
 
     set +e
     docker run --rm \
+      --user "$(id -u):$(id -g)" \
       -v "${PROJECT_ROOT}:/src" \
       -w /src/cli \
+      -e HOME=/tmp \
+      -e GOCACHE=/tmp/go-build \
+      -e GOMODCACHE=/tmp/go-mod \
       -e AAVA_CLI_VERSION="${ver}" \
       -e AAVA_BUILD_TIME="${bt}" \
       golang:1.22-bookworm \
@@ -572,12 +630,25 @@ run_rollback() {
     fi
 
     # Best-effort: preserve any current local changes before switching branches.
-    if [ -n "$(git -c safe.directory="${PROJECT_ROOT}" status --porcelain 2>/dev/null || true)" ]; then
+    if [ -n "$(git -c safe.directory="${PROJECT_ROOT}" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
       echo "==> Working tree is dirty; stashing changes (best-effort)" >&2
-      git -c safe.directory="${PROJECT_ROOT}" stash push -u -m "aava rollback ${JOB_ID}" >/dev/null 2>&1 || true
+      git -c safe.directory="${PROJECT_ROOT}" stash push -m "aava rollback ${JOB_ID}" >/dev/null 2>&1 || true
     fi
 
-    git -c safe.directory="${PROJECT_ROOT}" checkout "${pre_branch}"
+    checkout_error="$(mktemp)"
+    if ! git -c safe.directory="${PROJECT_ROOT}" checkout "${pre_branch}" 2>"${checkout_error}"; then
+      if grep -qi "untracked working tree files would be overwritten" "${checkout_error}"; then
+        echo "==> Untracked paths conflict with rollback target; preserving them in a dedicated stash" >&2
+        git -c safe.directory="${PROJECT_ROOT}" stash push -u \
+          -m "aava rollback ${JOB_ID} untracked checkout conflicts" >/dev/null
+        git -c safe.directory="${PROJECT_ROOT}" checkout "${pre_branch}"
+      else
+        cat "${checkout_error}" >&2
+        rm -f "${checkout_error}"
+        exit 1
+      fi
+    fi
+    rm -f "${checkout_error}"
 
     if [ -f "${PROJECT_ROOT}/${backup_rel}/.env" ]; then
       cp -f "${PROJECT_ROOT}/${backup_rel}/.env" "${PROJECT_ROOT}/.env"

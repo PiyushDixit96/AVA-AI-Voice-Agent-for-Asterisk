@@ -201,6 +201,135 @@ async def test_response_output_text_delta_still_handled(provider):
     assert captured == [("World", False)]
 
 
+@pytest.mark.asyncio
+async def test_buffered_tail_notifies_engine_before_audio_done_cleanup(provider):
+    """Caller speech must flush platform playback before drain-oriented cleanup."""
+    ordering: list[str] = []
+
+    async def on_event(event):
+        assert event["type"] == "ProviderBargeIn"
+        ordering.append("provider_barge_in")
+
+    async def emit_audio_done():
+        ordering.append("audio_done")
+
+    provider.on_event = on_event
+    provider._emit_audio_done = emit_audio_done
+    provider._current_response_id = None
+    provider._greeting_response_id = None
+    provider._greeting_completed = True
+    provider._outbuf.extend(b"buffered-tail")
+
+    await provider._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    assert ordering == ["provider_barge_in", "audio_done"]
+    assert provider._outbuf == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_server_vad_barge_in_does_not_send_manual_response_cancel(provider):
+    """xAI owns cancellation in server_vad mode; AVA only flushes local egress."""
+    ws = _RecordingWebSocket()
+    provider.websocket = ws
+    provider._current_response_id = "resp-active"
+    provider._greeting_response_id = "resp-greeting"
+    provider._greeting_completed = True
+    provider._outbuf.extend(b"old-audio")
+    observed = []
+
+    async def on_event(event):
+        observed.append(event["type"])
+
+    async def emit_audio_done():
+        observed.append("AgentAudioDone")
+
+    provider.on_event = on_event
+    provider._emit_audio_done = emit_audio_done
+
+    await provider._handle_event({"type": "input_audio_buffer.speech_started"})
+
+    assert observed == ["ProviderBargeIn", "AgentAudioDone"]
+    assert provider._outbuf == bytearray()
+    assert all(event["type"] != "response.cancel" for event in ws.parsed_events())
+
+
+@pytest.mark.asyncio
+async def test_tracks_audio_item_and_sends_playback_truncation(provider):
+    ws = _RecordingWebSocket()
+    provider.websocket = ws
+    provider._current_response_id = "resp-1"
+
+    await provider._handle_event(
+        {
+            "type": "response.output_item.added",
+            "response_id": "resp-1",
+            "item": {"id": "item-1", "type": "message", "role": "assistant"},
+        }
+    )
+    await provider._handle_event(
+        {
+            "type": "response.content_part.added",
+            "item_id": "item-1",
+            "content_index": 2,
+            "part": {"type": "audio"},
+        }
+    )
+
+    assert await provider.truncate_assistant_audio(7840) is True
+    event = ws.parsed_events()[-1]
+    assert event["type"] == "conversation.item.truncate"
+    assert event["item_id"] == "item-1"
+    assert event["content_index"] == 2
+    assert event["audio_end_ms"] == 7840
+
+
+@pytest.mark.asyncio
+async def test_local_barge_flushes_provider_pacer_and_quarantines_old_audio(provider):
+    provider._current_response_id = None
+    provider._assistant_audio_response_id = "resp-old"
+    provider._outbuf.extend(b"old-response-audio")
+    provider._pacer_running = True
+    provider._pacer_task = asyncio.create_task(asyncio.sleep(30))
+
+    dropped = await provider.handle_local_barge_in()
+
+    assert dropped == len(b"old-response-audio")
+    assert provider._outbuf == bytearray()
+    assert provider._pacer_running is False
+    assert provider._pacer_task.cancelled() or provider._pacer_task.cancelling()
+    assert provider._drop_output_until_next_response is True
+
+
+@pytest.mark.asyncio
+async def test_local_barge_drops_old_deltas_until_replacement_response(provider):
+    provider._drop_output_until_next_response = True
+    provider._current_response_id = None
+    provider._assistant_audio_response_id = "resp-old"
+
+    await provider._handle_output_audio("b2xkLWF1ZGlv")
+    assert provider._outbuf == bytearray()
+
+    provider._greeting_completed = True
+    await provider._handle_event({"type": "response.created", "response": {"id": "resp-new"}})
+    assert provider._drop_output_until_next_response is False
+    assert provider._current_response_id == "resp-new"
+
+
+@pytest.mark.asyncio
+async def test_server_vad_pacer_start_preserves_input_buffer(provider):
+    ws = _RecordingWebSocket()
+    provider.websocket = ws
+    provider.on_event = lambda event: None
+    provider._pacer_loop = lambda: asyncio.sleep(30)
+
+    await provider._ensure_pacer_started()
+    try:
+        assert all(event["type"] != "input_audio_buffer.clear" for event in ws.parsed_events())
+    finally:
+        provider._pacer_running = False
+        provider._pacer_task.cancel()
+
+
 # --------------------------------------------------------------------------- #
 # 3. provider_key propagation                                                  #
 # --------------------------------------------------------------------------- #

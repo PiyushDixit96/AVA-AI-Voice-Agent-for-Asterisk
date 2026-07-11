@@ -16,7 +16,10 @@ COPY cli/go.mod cli/go.sum ./
 RUN go mod download
 
 COPY cli/ ./
-RUN CGO_ENABLED=0 go build -o /out/agent ./cmd/agent
+ARG AAVA_CLI_VERSION=dev
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-X main.version=${AAVA_CLI_VERSION}" \
+    -o /out/agent ./cmd/agent
 
 FROM debian:bookworm-slim
 
@@ -28,7 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     gnupg \
+    gosu \
     jq \
+    passwd \
     util-linux \
     tzdata \
     && install -m 0755 -d /etc/apt/keyrings \
