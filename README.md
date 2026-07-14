@@ -218,7 +218,7 @@ Release evidence and remaining gates are tracked in the
 
 </details>
 
-<details open>
+<details>
 <summary><b>v7.3.1 — Silence watchdog & safe call endings ☎️</b></summary>
 
 **AVA now protects silent calls and finishes every terminal message before disconnecting.**
