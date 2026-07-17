@@ -1,3 +1,8 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
 from src.tools.telephony.voicemail import VoicemailTool
 
 
@@ -30,3 +35,25 @@ def test_agent_selected_mailbox_wins():
         "mailboxes": {"support": {"extension": "2002"}},
         "extension": "2002",
     }) == ("support", "2002")
+
+
+@pytest.mark.asyncio
+async def test_execute_fails_closed_when_voicemail_is_globally_disabled():
+    context = SimpleNamespace(
+        call_id="call-disabled-voicemail",
+        caller_channel_id="channel-disabled-voicemail",
+        get_config_value=MagicMock(
+            return_value={"enabled": False, "extension": "2765"}
+        ),
+        update_session=AsyncMock(),
+        ari_client=SimpleNamespace(send_command=AsyncMock()),
+    )
+
+    result = await VoicemailTool().execute({}, context)
+
+    assert result == {
+        "status": "failed",
+        "message": "Voicemail is not available",
+    }
+    context.update_session.assert_not_awaited()
+    context.ari_client.send_command.assert_not_awaited()

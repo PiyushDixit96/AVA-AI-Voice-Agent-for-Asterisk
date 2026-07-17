@@ -119,6 +119,12 @@ class VoicemailTool(Tool):
                 "status": "failed",
                 "message": "Voicemail is not available",
             }
+        if isinstance(config, dict) and config.get("enabled") is False:
+            logger.warning("Voicemail tool disabled", call_id=context.call_id)
+            return {
+                "status": "failed",
+                "message": "Voicemail is not available",
+            }
         
         mailbox_key, extension = self.resolve_mailbox(config)
         if not extension:
